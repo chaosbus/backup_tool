@@ -8,6 +8,9 @@ const state = {
   running: false,
   appProg: new Map(),
   selectedAppId: null,
+  // Runtime backup selection per app id; apps absent from the map default to
+  // their `enabled` config value. Survives list re-renders.
+  userChecked: new Map(),
 };
 
 // ---------------------------------------------------------------------------
@@ -36,10 +39,15 @@ function renderApps() {
 
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.checked = app.enabled;
+    cb.checked = state.userChecked.has(app.id)
+      ? state.userChecked.get(app.id)
+      : app.enabled;
     cb.disabled = state.running || !app.has_paths;
     cb.dataset.id = app.id;
-    cb.addEventListener("change", () => updateSelectAll());
+    cb.addEventListener("change", () => {
+      state.userChecked.set(app.id, cb.checked);
+      updateSelectAll();
+    });
 
     const name = document.createElement("span");
     name.className = "app-name";
@@ -694,7 +702,10 @@ $("#btn-exit").addEventListener("click", () => {
 });
 $("#select-all").addEventListener("change", (e) => {
   document.querySelectorAll("#app-list input[type=checkbox]").forEach((b) => {
-    if (!b.disabled) b.checked = e.target.checked;
+    if (!b.disabled) {
+      b.checked = e.target.checked;
+      state.userChecked.set(b.dataset.id, b.checked);
+    }
   });
   updateSelectAll();
 });
@@ -715,8 +726,8 @@ $("#app-drawer").addEventListener("click", (e) => {
 });
 
 $("#settings-close").addEventListener("click", closeSettings);
-$("#settings-cancel").addEventListener("click", closeSettings);
-$("#settings-save").addEventListener("click", saveSettingsForm);
+$("#s-cancel").addEventListener("click", closeSettings);
+$("#s-save").addEventListener("click", saveSettingsForm);
 $("#s-restore-defaults").addEventListener("click", restoreDefaults);
 $("#s-reload").addEventListener("click", reloadSettingsFromDisk);
 $("#s-add-exclude").addEventListener("click", () => $("#s-exclude-list").appendChild(makeExcludeRow("", "**/*.tmp").row));

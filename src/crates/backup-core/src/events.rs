@@ -115,6 +115,9 @@ pub fn spawn_aggregator(
     apps_total: usize,
 ) -> crossbeam_channel::Receiver<Event> {
     let (out_tx, out_rx) = bounded(4096);
+    // Extra consumer handle used inside the thread to shed the oldest queued
+    // events when the UI falls behind.
+    let drain = out_rx.clone();
 
     std::thread::spawn(move || {
         let mut app_done_bytes: HashMap<String, u64> = HashMap::new();
@@ -136,10 +139,8 @@ pub fn spawn_aggregator(
                     let entry = app_done_bytes.entry(app_id.clone()).or_insert(0);
                     *entry = (*entry).max(*bytes_done);
                 }
-                Event::AppFinished { result, .. } => {
-                    if *result != AppResult::Cancelled {
-                        apps_done += 1;
-                    }
+                Event::AppFinished { result, .. } if *result != AppResult::Cancelled => {
+                    apps_done += 1;
                 }
                 _ => {}
             }
@@ -151,7 +152,9 @@ pub fn spawn_aggregator(
                     | Event::OverallProgress { .. }
             );
 
-            if !is_progress && last_emit.elapsed() >= Duration::from_millis(100) {
+            // Throttle overall progress by time only: formats that emit only
+            // AppProgress (tar.gz/dir) would otherwise never refresh it.
+            if last_emit.elapsed() >= Duration::from_millis(100) {
                 last_emit = Instant::now();
                 let bytes_done = app_done_bytes.values().sum();
                 let eta = compute_eta(started_at, bytes_done, bytes_total);
@@ -167,14 +170,9 @@ pub fn spawn_aggregator(
             // Forward raw event. If the UI is slow and the bound is full, drop
             // the oldest progress events but keep structural ones.
             if is_progress {
-                if out_tx.try_send(ev).is_err() {
-                    // UI is behind: drop the oldest progress frame by making room
-                    // via a non-blocking receive from the bounded channel is not
-                    // possible on the Sender side, so just emit a debug note.
-                    let _ = out_tx.try_send(Event::Log {
-                        level: LogLevel::Debug,
-                        msg: "progress event dropped (UI backlog)".into(),
-                    });
+                if out_tx.try_send(ev.clone()).is_err() {
+                    let _ = drain.try_recv();
+                    let _ = out_tx.try_send(ev);
                 }
             } else if out_tx.send(ev).is_err() {
                 break; // consumer gone

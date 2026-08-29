@@ -167,4 +167,35 @@ if (tauriConfig.app == null || tauriConfig.app.withGlobalTauri !== true) {
   fail("tauri.conf.json must set app.withGlobalTauri = true");
 }
 
-console.log(`check-gui: OK (${loaded.length} external scripts, ${tags.length} script tags)`);
+// Cross-check: every `#id` referenced from ui scripts (via $("#id"),
+// querySelector, querySelectorAll, ...) must exist in index.html. A missing id
+// makes addEventListener throw at wire-up time and silently breaks every
+// listener registered after it.
+const idRefs = new Set();
+const htmlIds = new Set();
+const idRefRe = /["']#([A-Za-z][A-Za-z0-9_-]*)/g;
+const htmlIdRe = /\bid\s*=\s*["']([A-Za-z][A-Za-z0-9_-]*)["']/g;
+
+for (const entry of loaded) {
+  // Scan the raw source (not the string-stripped one): id references live
+  // inside string literals. Comment mentions are acceptable false positives
+  // only if they name existing ids.
+  const source = fs.readFileSync(entry.resolved, "utf8");
+  let match;
+  while ((match = idRefRe.exec(source)) !== null) {
+    idRefs.add(match[1]);
+  }
+}
+let idMatch;
+while ((idMatch = htmlIdRe.exec(stripHtmlComments(html))) !== null) {
+  htmlIds.add(idMatch[1]);
+}
+
+const missing = [...idRefs].filter((id) => !htmlIds.has(id)).sort();
+if (missing.length) {
+  fail(`scripts reference id(s) not present in index.html: ${missing.join(", ")}`);
+}
+
+console.log(
+  `check-gui: OK (${loaded.length} external scripts, ${tags.length} script tags, ${idRefs.size} id refs)`,
+);

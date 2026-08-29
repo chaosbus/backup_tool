@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
 use backup_core::config::load_config;
 use backup_core::events::{
-    AppResult, CancelFlag, Event, LogLevel, new_event_stream, spawn_aggregator,
+    new_event_stream, spawn_aggregator, AppResult, CancelFlag, Event, LogLevel,
 };
-use backup_core::{BackupOptions, backup};
+use backup_core::{backup, BackupOptions};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "backup-tool", version, about = "Cross-platform app backup tool")]
+#[command(
+    name = "backup-tool",
+    version,
+    about = "Cross-platform app backup tool"
+)]
 struct Cli {
     /// Path to config file (default: platform config dir)
     #[arg(long, global = true)]
@@ -49,14 +53,20 @@ enum Command {
 #[derive(Subcommand)]
 enum AppsAction {
     List,
-    Add { id: String, name: String, path: String },
-    Remove { id: String },
+    Add {
+        id: String,
+        name: String,
+        path: String,
+    },
+    Remove {
+        id: String,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (config, warnings) = load_config(cli.config.as_deref())
-        .with_context(|| "failed to load config")?;
+    let (config, warnings) =
+        load_config(cli.config.as_deref()).with_context(|| "failed to load config")?;
 
     for w in &warnings {
         eprintln!("warning: {w}");
@@ -65,7 +75,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Backup { app, all, format } => cmd_backup(config, app, all, format),
         Command::History { app } => cmd_history(&config, app.as_deref()),
-        Command::Apps { action } => cmd_apps(&config, action),
+        Command::Apps { action } => cmd_apps(config, action),
         Command::Check => cmd_check(&config),
     }
 }
@@ -73,7 +83,7 @@ fn main() -> Result<()> {
 fn cmd_backup(
     config: backup_core::Config,
     app_ids: Vec<String>,
-    all: bool,
+    _all: bool,
     format: Option<String>,
 ) -> Result<()> {
     let mut config = config;
@@ -86,12 +96,10 @@ fn cmd_backup(
         };
     }
 
-    let mut options = BackupOptions {
+    // Empty selection = all enabled apps.
+    let options = BackupOptions {
         app_ids: app_ids.clone(),
     };
-    if app_ids.is_empty() && all {
-        options.app_ids = vec![];
-    }
 
     let (tx, raw_rx) = new_event_stream();
     let apps_total = if options.app_ids.is_empty() {
@@ -101,17 +109,20 @@ fn cmd_backup(
     };
     let rx = spawn_aggregator(raw_rx, apps_total);
 
+    // Print events as they arrive so progress is visible during the run.
+    let printer = std::thread::spawn(move || {
+        for ev in rx.iter() {
+            print_event(&ev);
+        }
+    });
+
     let cancel = CancelFlag::new();
     let started = std::time::Instant::now();
     let report = {
         let tx = tx;
         backup(&config, &options, tx, &cancel)?
     };
-
-    // Drain remaining events for final overall progress.
-    for ev in rx.try_iter() {
-        print_event(&ev);
-    }
+    let _ = printer.join();
 
     println!(
         "\nDone in {:.1}s. dest: {}",
@@ -194,23 +205,26 @@ fn cmd_history(config: &backup_core::Config, app: Option<&str>) -> Result<()> {
     let history = backup_core::history::load_history(&dest);
     let mut entries = history.entries.iter().collect::<Vec<_>>();
     if let Some(app) = app {
-        entries.retain(|e| &e.app_id == app);
+        entries.retain(|e| e.app_id == app);
     }
     for e in entries {
-        println!(
-            "{}\t{}\t{}\t{}",
-            e.app_id, e.file, e.size, e.status
-        );
+        println!("{}\t{}\t{}\t{}", e.app_id, e.file, e.size, e.status);
     }
     Ok(())
 }
 
-fn cmd_apps(config: &backup_core::Config, action: AppsAction) -> Result<()> {
+fn cmd_apps(mut config: backup_core::Config, action: AppsAction) -> Result<()> {
     match action {
         AppsAction::List => {
             for app in &config.apps {
                 let enabled = if app.enabled { "enabled" } else { "disabled" };
-                println!("{} ({}) [{}] - {}", app.id, app.name, enabled, app.excludes.join(","));
+                println!(
+                    "{} ({}) [{}] - {}",
+                    app.id,
+                    app.name,
+                    enabled,
+                    app.excludes.join(",")
+                );
                 for (platform, paths) in &app.paths {
                     for p in paths {
                         println!("    {platform}: {p}");
@@ -219,15 +233,35 @@ fn cmd_apps(config: &backup_core::Config, action: AppsAction) -> Result<()> {
             }
         }
         AppsAction::Add { id, name, path } => {
-            println!(
-                "note: app add only validated syntax; editing config at {} directly is required to persist",
-                config.source.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
-            );
-            let _ = (id, name, path);
+            let platform = backup_core::Platform::current();
+            let final_id = if id.trim().is_empty() {
+                let existing: Vec<&str> = config.apps.iter().map(|a| a.id.as_str()).collect();
+                backup_core::generate_app_id(&name, &existing)
+            } else {
+                id
+            };
+            let mut paths = std::collections::HashMap::new();
+            paths.insert(platform.as_str().to_string(), vec![path.clone()]);
+            let app = backup_core::App {
+                id: final_id.clone(),
+                name: name.trim().to_string(),
+                enabled: true,
+                compress: true,
+                paths,
+                excludes: vec![],
+            };
+            config
+                .upsert_app(app, platform)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            config.save().context("failed to save config")?;
+            println!("app added: {final_id} ({}) -> {path}", name.trim());
         }
         AppsAction::Remove { id } => {
-            let _ = id;
-            println!("note: removal requires editing the config file directly (not yet wired to save)");
+            if !config.remove_app(&id) {
+                anyhow::bail!("unknown app id: {id}");
+            }
+            config.save().context("failed to save config")?;
+            println!("app removed: {id}");
         }
     }
     Ok(())
@@ -235,9 +269,19 @@ fn cmd_apps(config: &backup_core::Config, action: AppsAction) -> Result<()> {
 
 fn cmd_check(config: &backup_core::Config) -> Result<()> {
     let dest = config.resolved_dest().context("resolve backup dest")?;
-    println!("config: {}", config.source.as_deref().map(|p| p.display().to_string()).unwrap_or_default());
+    println!(
+        "config: {}",
+        config
+            .source
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
     println!("dest:   {}", dest.display());
-    println!("format: {:?}  parallel: {}  retention: {}", config.backup.format, config.backup.parallel, config.backup.retention);
+    println!(
+        "format: {:?}  parallel: {}  retention: {}",
+        config.backup.format, config.backup.parallel, config.backup.retention
+    );
     println!("apps:   {}", config.apps.len());
     for app in &config.apps {
         let platform = backup_core::Platform::current();
@@ -246,7 +290,12 @@ fn cmd_check(config: &backup_core::Config) -> Result<()> {
             match backup_core::pathres::expand_path(raw, platform, config.config_dir().as_deref()) {
                 backup_core::pathres::PathState::Resolved { path } => {
                     let exists = path.exists();
-                    println!("  {} -> {} [{}]", app.id, path.display(), if exists { "ok" } else { "missing" });
+                    println!(
+                        "  {} -> {} [{}]",
+                        app.id,
+                        path.display(),
+                        if exists { "ok" } else { "missing" }
+                    );
                 }
                 backup_core::pathres::PathState::UndefinedVar { var } => {
                     println!("  {} -> UNDEFINED VAR {var}", app.id);

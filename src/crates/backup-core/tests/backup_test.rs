@@ -406,6 +406,78 @@ fn summary_write_failure_removes_archive_and_fails_app() {
 }
 
 #[test]
+fn backup_packs_overlapping_roots_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("backups");
+    write_file(&src.join("a.txt"), "alpha");
+    write_file(&src.join("sub").join("b.txt"), "beta");
+
+    // src/sub is nested inside src: b.txt is reachable from both roots.
+    let config = config_for(&dest, vec![src.clone(), src.join("sub")], Format::Zip, 0);
+    let report = run_backup(&config);
+    assert_eq!(report.ok(), 1);
+
+    let app_dir = dest.join("testapp");
+    let zip_file = find_archive(&app_dir, ".zip");
+    let file = std::fs::File::open(app_dir.join(&zip_file)).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+    let count = names.iter().filter(|n| n.ends_with("sub/b.txt")).count();
+    assert_eq!(count, 1, "duplicate entry for overlapping root: {names:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_preserves_symlinks_zip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("backups");
+    write_file(&src.join("a.txt"), "alpha");
+    std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
+
+    let config = build_config(&src, &dest);
+    let report = run_backup(&config);
+    assert_eq!(report.ok(), 1);
+
+    let app_dir = dest.join("testapp");
+    let zip_file = find_archive(&app_dir, ".zip");
+    let file = std::fs::File::open(app_dir.join(&zip_file)).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut entry = archive.by_name("src/link.txt").expect("link entry");
+    assert_eq!(entry.size(), "a.txt".len() as u64);
+    assert_eq!(entry.unix_mode(), Some(0o120777));
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_preserves_symlinks_targz() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("backups");
+    write_file(&src.join("a.txt"), "alpha");
+    std::os::unix::fs::symlink("a.txt", src.join("link.txt")).unwrap();
+
+    let config = config_for(&dest, vec![src], Format::TarGz, 0);
+    let report = run_backup(&config);
+    assert_eq!(report.ok(), 1);
+
+    let app_dir = dest.join("testapp");
+    let tar_file = find_archive(&app_dir, ".tar.gz");
+    let file = std::fs::File::open(app_dir.join(&tar_file)).unwrap();
+    let archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut saw_link = false;
+    for entry in archive.entries().unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().unwrap().to_string_lossy() == "src/link.txt" {
+            assert!(entry.header().entry_type().is_symlink());
+            saw_link = true;
+        }
+    }
+    assert!(saw_link, "symlink entry missing from tar");
+}
+
+#[test]
 fn rebuild_from_fs_uses_summary_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src");

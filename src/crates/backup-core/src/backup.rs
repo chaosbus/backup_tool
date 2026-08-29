@@ -67,6 +67,15 @@ pub fn backup(
     let selected: Vec<&App> = if options.app_ids.is_empty() {
         config.apps.iter().filter(|a| a.enabled).collect()
     } else {
+        let unknown: Vec<&str> = options
+            .app_ids
+            .iter()
+            .filter(|id| !config.apps.iter().any(|a| &a.id == *id))
+            .map(|id| id.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            return Err(crate::config::ConfigError::UnknownApps(unknown.join(", ")));
+        }
         config
             .apps
             .iter()
@@ -91,8 +100,6 @@ pub fn backup(
     let history = HistoryWriter::new();
     let outcomes: std::sync::Arc<std::sync::Mutex<Vec<AppOutcome>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let removed_retention: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Worker pool: pull owned app clones from a shared queue so threads don't
     // borrow past this function.
@@ -112,15 +119,13 @@ pub fn backup(
         let dest = dest.clone();
         let config = config.clone();
         let outcomes = outcomes.clone();
-        let removed_retention = removed_retention.clone();
 
         handles.push(std::thread::spawn(move || {
             while let Ok(app) = queue_rx.recv() {
                 let outcome = process_app(&app, &config, &dest, &platform, &tx, &cancel, &history);
+                // after_each: free disk space as soon as each app completes.
                 if config.backup.cleanup == CleanupMode::AfterEach && config.backup.retention > 0 {
-                    if let Ok(removed) = history.apply_retention(&dest, config.backup.retention) {
-                        removed_retention.lock().unwrap().extend(removed);
-                    }
+                    apply_retention_and_delete(&history, &dest, config.backup.retention);
                 }
                 outcomes.lock().unwrap().push(outcome);
             }
@@ -132,16 +137,7 @@ pub fn backup(
 
     // At-end retention cleanup.
     if config.backup.cleanup == CleanupMode::AtEnd && config.backup.retention > 0 {
-        if let Ok(removed) = history.apply_retention(&dest, config.backup.retention) {
-            removed_retention.lock().unwrap().extend(removed);
-        }
-    }
-
-    // Delete retained-away archives from disk together with their summary sidecars.
-    for (app_id, file) in removed_retention.lock().unwrap().iter() {
-        let archive = dest.join(app_id).join(file);
-        let _ = remove_archive(&archive);
-        let _ = std::fs::remove_file(summary_path_for(&archive));
+        apply_retention_and_delete(&history, &dest, config.backup.retention);
     }
 
     let report = BackupReport {
@@ -156,6 +152,18 @@ pub fn backup(
 
 fn now_string() -> String {
     chrono::Local::now().to_rfc3339()
+}
+
+/// Apply retention to the index and immediately delete the retired archives
+/// (plus their summary sidecars) from disk.
+fn apply_retention_and_delete(history: &HistoryWriter, dest: &Path, keep: usize) {
+    if let Ok(removed) = history.apply_retention(dest, keep) {
+        for (app_id, file) in removed {
+            let archive = dest.join(app_id).join(file);
+            let _ = remove_archive(&archive);
+            let _ = std::fs::remove_file(summary_path_for(&archive));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +610,7 @@ fn is_excluded(excludes: &GlobSet, abs: &Path, rel: &Path) -> bool {
     excludes.is_match(rel_slash.as_str()) || excludes.is_match(abs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_roots(
     roots: &[PathBuf],
     excludes: &GlobSet,
@@ -765,6 +774,7 @@ fn build_archive_prefixes(roots: &[PathBuf]) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pack_app(
     roots: &[(PathBuf, String)],
     empty_dirs: &[PathBuf],
@@ -827,6 +837,7 @@ fn unique_dest_file(app_dir: &Path, base_name: &str, format: Format) -> PathBuf 
     candidate
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pack_zip(
     roots: &[(PathBuf, String)],
     empty_dirs: &[PathBuf],
@@ -849,6 +860,8 @@ fn pack_zip(
         .compression_method(zip::CompressionMethod::Deflated);
     let mut done: u64 = 0;
     let mut bytes_done: u64 = 0;
+    // Files reachable from several (overlapping) roots are packed once.
+    let mut packed_files: HashSet<&PathBuf> = HashSet::new();
 
     macro_rules! emit_progress {
         () => {{
@@ -884,38 +897,67 @@ fn pack_zip(
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err("cancelled".into());
             }
-            if !path.starts_with(root) {
+            if !path.starts_with(root) || !packed_files.insert(path) {
                 continue;
             }
             let name = archive_name(prefix, root, path);
-            let mut f = match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = tx.send(Event::Log {
-                        level: LogLevel::Warn,
-                        msg: format!("cannot open {}, skipped: {e}", path.display()),
-                    });
-                    continue;
-                }
-            };
-            let written = match zw.start_file(name.clone(), opts) {
-                Err(e) => {
-                    let _ = tx.send(Event::Log {
-                        level: LogLevel::Warn,
-                        msg: format!("failed to add {} to archive: {e}", path.display()),
-                    });
-                    continue;
-                }
-                Ok(()) => match std::io::copy(&mut f, &mut zw) {
-                    Ok(n) => n,
+            // Symlinks are stored as links (unix mode), not as their target's
+            // content.
+            let is_link = std::fs::symlink_metadata(path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            let written = if is_link {
+                let target = match std::fs::read_link(path) {
+                    Ok(t) => t,
                     Err(e) => {
                         let _ = tx.send(Event::Log {
                             level: LogLevel::Warn,
-                            msg: format!("failed to pack {}, skipped: {e}", path.display()),
+                            msg: format!("cannot read link {}, skipped: {e}", path.display()),
                         });
                         continue;
                     }
-                },
+                };
+                let target_str = target.to_string_lossy().into_owned();
+                match zw.add_symlink(name.clone(), target_str.clone(), opts) {
+                    Err(e) => {
+                        let _ = tx.send(Event::Log {
+                            level: LogLevel::Warn,
+                            msg: format!("failed to add {} to archive: {e}", path.display()),
+                        });
+                        continue;
+                    }
+                    Ok(()) => target_str.len() as u64,
+                }
+            } else {
+                let mut f = match std::fs::File::open(path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = tx.send(Event::Log {
+                            level: LogLevel::Warn,
+                            msg: format!("cannot open {}, skipped: {e}", path.display()),
+                        });
+                        continue;
+                    }
+                };
+                match zw.start_file(name.clone(), opts) {
+                    Err(e) => {
+                        let _ = tx.send(Event::Log {
+                            level: LogLevel::Warn,
+                            msg: format!("failed to add {} to archive: {e}", path.display()),
+                        });
+                        continue;
+                    }
+                    Ok(()) => match std::io::copy(&mut f, &mut zw) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = tx.send(Event::Log {
+                                level: LogLevel::Warn,
+                                msg: format!("failed to pack {}, skipped: {e}", path.display()),
+                            });
+                            continue;
+                        }
+                    },
+                }
             };
             done += 1;
             bytes_done += written;
@@ -938,6 +980,7 @@ fn pack_zip(
     Ok((final_path, size))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pack_targz(
     roots: &[(PathBuf, String)],
     empty_dirs: &[PathBuf],
@@ -959,6 +1002,8 @@ fn pack_targz(
     let mut builder = tar::Builder::new(enc);
     let mut done: u64 = 0;
     let mut bytes_done: u64 = 0;
+    // Files reachable from several (overlapping) roots are packed once.
+    let mut packed_files: HashSet<&PathBuf> = HashSet::new();
 
     for dir in empty_dirs {
         if cancel.is_cancelled() {
@@ -969,7 +1014,7 @@ fn pack_targz(
         for (root, prefix) in roots {
             if dir.starts_with(root) {
                 let name = archive_name(prefix, root, dir);
-                let _ = builder.append_dir(&dir, &name);
+                let _ = builder.append_dir(dir, &name);
             }
         }
     }
@@ -981,7 +1026,7 @@ fn pack_targz(
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err("cancelled".into());
             }
-            if !path.starts_with(root) {
+            if !path.starts_with(root) || !packed_files.insert(path) {
                 continue;
             }
             let name = archive_name(prefix, root, path);
@@ -1025,7 +1070,9 @@ fn append_file_to_tar(
     path: &Path,
     name: &str,
 ) -> Result<u64, std::io::Error> {
-    let meta = std::fs::metadata(path)?;
+    // Use symlink_metadata so symlinks are detected (fs::metadata follows
+    // links and would report the target's type instead).
+    let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(path)?;
         let mut header = tar::Header::new_gnu();
@@ -1040,6 +1087,7 @@ fn append_file_to_tar(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pack_dir(
     roots: &[(PathBuf, String)],
     empty_dirs: &[PathBuf],
@@ -1050,12 +1098,17 @@ fn pack_dir(
     tx: &EventSender,
     cancel: &CancelFlag,
 ) -> PackResult {
-    let final_path = app_dir.join(format!("{}.dir", base_name));
+    let final_path = unique_dest_file(app_dir, base_name, Format::Dir);
     let tmp_path = app_dir.join(format!("{}.dir.tmp", base_name));
     if tmp_path.exists() {
         let _ = std::fs::remove_dir_all(&tmp_path);
     }
     std::fs::create_dir_all(&tmp_path).map_err(|e| e.to_string())?;
+
+    let mut done: u64 = 0;
+    let mut bytes_done: u64 = 0;
+    // Files reachable from several (overlapping) roots are copied once.
+    let mut packed_files: HashSet<&PathBuf> = HashSet::new();
 
     for dir in empty_dirs {
         for (root, prefix) in roots {
@@ -1066,16 +1119,13 @@ fn pack_dir(
         }
     }
 
-    let mut done: u64 = 0;
-    let mut bytes_done: u64 = 0;
-
     for (root, prefix) in roots {
         for path in files {
             if cancel.is_cancelled() {
                 let _ = std::fs::remove_dir_all(&tmp_path);
                 return Err("cancelled".into());
             }
-            if !path.starts_with(root) {
+            if !path.starts_with(root) || !packed_files.insert(path) {
                 continue;
             }
             let target = archive_target(&tmp_path, prefix, root, path);
@@ -1136,4 +1186,22 @@ fn sha256_hex(path: &Path) -> std::io::Result<String> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unique_dest_file_avoids_dir_format_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_dir = tmp.path().join("testapp");
+        std::fs::create_dir_all(&app_dir).unwrap();
+
+        let first = unique_dest_file(&app_dir, "testapp_20260101_000000", Format::Dir);
+        std::fs::create_dir_all(&first).unwrap();
+        let second = unique_dest_file(&app_dir, "testapp_20260101_000000", Format::Dir);
+        assert_ne!(first, second);
+        assert!(second.to_string_lossy().ends_with("_1.dir"));
+    }
 }

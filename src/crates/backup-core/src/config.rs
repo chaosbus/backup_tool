@@ -1,22 +1,18 @@
 use crate::platform::Platform;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
+    #[default]
     Zip,
     #[serde(rename = "tar.gz")]
     TarGz,
     #[serde(rename = "dir")]
     Dir,
-}
-
-impl Default for Format {
-    fn default() -> Self {
-        Format::Zip
-    }
 }
 
 impl Format {
@@ -29,17 +25,12 @@ impl Format {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupMode {
+    #[default]
     AfterEach,
     AtEnd,
-}
-
-impl Default for CleanupMode {
-    fn default() -> Self {
-        CleanupMode::AfterEach
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +204,36 @@ impl Config {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
+    /// Atomically write this config back to `source` (temp file + fsync +
+    /// rename). Fails when the config was not loaded from a file.
+    pub fn save(&self) -> Result<(), ConfigError> {
+        let source = self.source.clone().ok_or(ConfigError::NoSource)?;
+        if let Some(parent) = source.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = serde_json::to_string_pretty(self)?;
+        let tmp = source.with_extension(
+            source
+                .extension()
+                .map(|ext| format!("{}.tmp", ext.to_string_lossy()))
+                .unwrap_or_else(|| "tmp".into()),
+        );
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, &source)
+        };
+        match write() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(err.into())
+            }
+        }
+    }
+
     /// Validate and add/update an app. Only paths stored under the given
     /// platform key are read; paths for other platforms are preserved.
     /// Returns a user-facing error message on invalid input.
@@ -294,6 +315,10 @@ pub enum ConfigError {
     DestSyntax { raw: String },
     #[error("no apps defined")]
     NoApps,
+    #[error("unknown app id(s): {0}")]
+    UnknownApps(String),
+    #[error("config file path unknown; load the config from a file first")]
+    NoSource,
 }
 
 /// Default config file location.
@@ -447,5 +472,52 @@ mod tests {
         assert_eq!(conflicted.len(), 64);
         assert!(conflicted.ends_with("-2"));
         assert_eq!(conflicted.chars().filter(|&c| c == 'a').count(), 62);
+    }
+
+    #[test]
+    fn save_writes_atomically_and_roundtrips() {
+        let tmp =
+            std::env::temp_dir().join(format!("backup-tool-save-test-{}", std::process::id()));
+        let source = tmp.join("config.json");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut config: Config = serde_json::from_str(r#"{"apps": []}"#).unwrap();
+        config.source = Some(source.clone());
+        config
+            .upsert_app(
+                App {
+                    id: "demo".into(),
+                    name: "Demo".into(),
+                    enabled: true,
+                    compress: true,
+                    paths: {
+                        let mut m = HashMap::new();
+                        m.insert("linux".into(), vec!["/tmp/demo".to_string()]);
+                        m
+                    },
+                    excludes: vec![],
+                },
+                Platform::Linux,
+            )
+            .unwrap();
+
+        config.save().unwrap();
+        assert!(!tmp.join("config.json.tmp").exists());
+
+        let reloaded: Config =
+            serde_json::from_str(&std::fs::read_to_string(&source).unwrap()).unwrap();
+        assert_eq!(reloaded.apps.len(), 1);
+        assert_eq!(reloaded.apps[0].id, "demo");
+        assert_eq!(
+            reloaded.apps[0].paths["linux"],
+            vec!["/tmp/demo".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn save_fails_without_source() {
+        let config: Config = serde_json::from_str(r#"{"apps": []}"#).unwrap();
+        assert!(matches!(config.save(), Err(ConfigError::NoSource)));
     }
 }

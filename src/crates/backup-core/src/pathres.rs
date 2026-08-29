@@ -61,14 +61,67 @@ enum ExpandErr {
     OtherPlatform,
 }
 
-fn expand_windows(raw: &str) -> (String, Option<ExpandErr>) {
-    let mut out = String::new();
-    let mut rest = raw;
+/// Maximum nested-expansion passes (a variable's value may itself contain
+/// variables). Prevents runaway loops on cyclic definitions.
+const MAX_EXPANSION_PASSES: usize = 5;
 
-    // A `$VAR` or `~` appearance means Linux/macOS syntax on Windows.
-    if raw.contains('$') || raw.contains("~/") || raw == "~" {
+/// True when `s` contains actual Windows variable syntax (`%NAME%` with a
+/// non-empty name). A lone or doubled `%` is a literal and does not count.
+fn has_windows_var_syntax(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        let after = &rest[i + 1..];
+        match after.find('%') {
+            None => return false,
+            Some(0) => rest = &after[1..], // "%%": skip the pair
+            Some(_) => return true,
+        }
+    }
+    false
+}
+
+/// True when `s` contains actual Unix variable syntax: a leading `~`/`~/`, or
+/// `$` followed by `{`, an ASCII letter/digit, or `_`. A trailing or otherwise
+/// isolated `$` is a literal and does not count.
+fn has_unix_var_syntax(s: &str) -> bool {
+    if s == "~" || s.starts_with("~/") {
+        return true;
+    }
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if let Some(&next) = chars.peek() {
+                if next == '{' || next.is_ascii_alphanumeric() || next == '_' {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn expand_windows(raw: &str) -> (String, Option<ExpandErr>) {
+    if has_unix_var_syntax(raw) {
         return (raw.to_string(), Some(ExpandErr::OtherPlatform));
     }
+    let mut current = raw.to_string();
+    for _ in 0..MAX_EXPANSION_PASSES {
+        match expand_windows_once(&current) {
+            Ok(next) => {
+                if next == current || !has_windows_var_syntax(&next) {
+                    return (next, None);
+                }
+                current = next;
+            }
+            Err(err) => return (current, Some(err)),
+        }
+    }
+    (current, None)
+}
+
+fn expand_windows_once(raw: &str) -> Result<String, ExpandErr> {
+    let mut out = String::new();
+    let mut rest = raw;
 
     while let Some(pct) = rest.find('%') {
         out.push_str(&rest[..pct]);
@@ -86,12 +139,9 @@ fn expand_windows(raw: &str) -> (String, Option<ExpandErr>) {
                     rest = &after[closing + 1..];
                 }
                 Err(_) => {
-                    return (
-                        out,
-                        Some(ExpandErr::Undefined {
-                            var: var.to_string(),
-                        }),
-                    )
+                    return Err(ExpandErr::Undefined {
+                        var: var.to_string(),
+                    })
                 }
             }
         } else {
@@ -101,22 +151,29 @@ fn expand_windows(raw: &str) -> (String, Option<ExpandErr>) {
         }
     }
     out.push_str(rest);
-    (out, None)
+    Ok(out)
 }
 
 fn expand_unix(raw: &str) -> (String, Option<ExpandErr>) {
-    if raw.contains('%') {
+    if has_windows_var_syntax(raw) {
         return (raw.to_string(), Some(ExpandErr::OtherPlatform));
     }
 
-    let mut out = String::new();
-    let mut rest = raw;
+    let mut current = raw.to_string();
 
-    // Expand ~/ and lone ~ using $HOME (resolve immediately so the value flows
-    // through the rest of the pipeline unchanged).
-    if rest == "~" {
+    // Expand ~/ and lone ~ using $HOME up front so the value flows through the
+    // rest of the pipeline unchanged.
+    if current == "~" {
+        return match std::env::var("HOME") {
+            Ok(home) => (home, None),
+            Err(_) => (
+                String::new(),
+                Some(ExpandErr::Undefined { var: "HOME".into() }),
+            ),
+        };
+    } else if current.starts_with("~/") {
         match std::env::var("HOME") {
-            Ok(home) => return (home, None),
+            Ok(home) => current = format!("{home}{}", &current[1..]),
             Err(_) => {
                 return (
                     String::new(),
@@ -124,15 +181,25 @@ fn expand_unix(raw: &str) -> (String, Option<ExpandErr>) {
                 )
             }
         }
-    } else if rest.starts_with("~/") {
-        match std::env::var("HOME") {
-            Ok(home) => {
-                out.push_str(&home);
-                rest = &rest[1..];
+    }
+
+    for _ in 0..MAX_EXPANSION_PASSES {
+        match expand_unix_once(&current) {
+            Ok(next) => {
+                if next == current || !has_unix_var_syntax(&next) {
+                    return (next, None);
+                }
+                current = next;
             }
-            Err(_) => return (out, Some(ExpandErr::Undefined { var: "HOME".into() })),
+            Err(err) => return (current, Some(err)),
         }
     }
+    (current, None)
+}
+
+fn expand_unix_once(raw: &str) -> Result<String, ExpandErr> {
+    let mut out = String::new();
+    let mut rest = raw;
 
     while let Some(dollar) = rest.find('$') {
         out.push_str(&rest[..dollar]);
@@ -148,12 +215,9 @@ fn expand_unix(raw: &str) -> (String, Option<ExpandErr>) {
                         rest = &after[end + 1..];
                     }
                     Err(_) => {
-                        return (
-                            out,
-                            Some(ExpandErr::Undefined {
-                                var: var.to_string(),
-                            }),
-                        )
+                        return Err(ExpandErr::Undefined {
+                            var: var.to_string(),
+                        })
                     }
                 }
             } else {
@@ -177,18 +241,15 @@ fn expand_unix(raw: &str) -> (String, Option<ExpandErr>) {
                     rest = &after[name_len..];
                 }
                 Err(_) => {
-                    return (
-                        out,
-                        Some(ExpandErr::Undefined {
-                            var: var.to_string(),
-                        }),
-                    )
+                    return Err(ExpandErr::Undefined {
+                        var: var.to_string(),
+                    })
                 }
             }
         }
     }
     out.push_str(rest);
-    (out, None)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -223,6 +284,66 @@ mod tests {
     fn windows_rejects_unix_syntax() {
         let state = expand_path("$HOME/.ssh", Platform::Windows, None);
         assert!(matches!(state, PathState::OtherPlatform { .. }));
+    }
+
+    #[test]
+    fn windows_keeps_dollar_literal() {
+        // A `$` not followed by a variable name is a literal path character.
+        let state = expand_path("C:\\Admin$\\data", Platform::Windows, None);
+        match state {
+            PathState::Resolved { path } => {
+                assert_eq!(path, PathBuf::from("C:\\Admin$\\data"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_rejects_tilde() {
+        let state = expand_path("~/x", Platform::Windows, None);
+        assert!(matches!(state, PathState::OtherPlatform { .. }));
+    }
+
+    #[test]
+    fn unix_keeps_percent_literal() {
+        // A lone `%` without a closing `%` is a literal path character.
+        let state = expand_path("$HOME/50%off", Platform::Linux, None);
+        match state {
+            PathState::Resolved { path } => {
+                let home = std::env::var("HOME").unwrap();
+                assert_eq!(path, PathBuf::from(format!("{home}/50%off")));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_nested_expansion() {
+        unsafe {
+            std::env::set_var("BACKUP_TOOL_TEST_BASE", "C:\\base");
+            std::env::set_var("BACKUP_TOOL_TEST_NESTED", "%BACKUP_TOOL_TEST_BASE%\\sub");
+        }
+        let state = expand_path("%BACKUP_TOOL_TEST_NESTED%\\app", Platform::Windows, None);
+        match state {
+            PathState::Resolved { path } => {
+                assert_eq!(path, PathBuf::from("C:\\base\\sub\\app"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unix_nested_expansion() {
+        let home = std::env::temp_dir().join("fakehome-nested");
+        unsafe {
+            std::env::set_var("BACKUP_TOOL_TEST_NESTED_UNIX", "${HOME}/sub");
+            std::env::set_var("HOME", &home);
+        }
+        let state = expand_path("$BACKUP_TOOL_TEST_NESTED_UNIX/app", Platform::Linux, None);
+        match state {
+            PathState::Resolved { path } => assert_eq!(path, home.join("sub").join("app")),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
