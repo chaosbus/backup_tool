@@ -1,0 +1,13 @@
+# Rust 构建产物
+src/target/
+
+# Tauri 自动生成文件（构建时由 tauri-build 重新生成）
+src/crates/gui/gen/
+
+# 临时与敏感文件
+*.tmp
+*.log
+.env
+.env.local
+*.pem
+*.key

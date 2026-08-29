@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "backup": {
+    "dest": "~/backups",
+    "format": "zip",
+    "parallel": 2,
+    "retention": 10,
+    "cleanup": "after_each",
+    "checksum": true,
+    "excludes": ["**/.DS_Store", "**/desktop.ini"]
+  },
+  "apps": [
+    {
+      "id": "vscode",
+      "name": "VSCode",
+      "enabled": true,
+      "paths": {
+        "windows": ["%APPDATA%\\Code\\User"],
+        "linux": ["$HOME/.config/Code/User"],
+        "macos": ["$HOME/Library/Application Support/Code/User"]
+      },
+      "excludes": ["Cache/**", "*.log"]
+    },
+    {
+      "id": "git",
+      "name": "Git",
+      "enabled": true,
+      "paths": {
+        "windows": ["%USERPROFILE%\\.gitconfig"],
+        "linux": ["$HOME/.gitconfig"]
+      },
+      "excludes": []
+    },
+    {
+      "id": "ssh",
+      "name": "SSH",
+      "enabled": true,
+      "paths": {
+        "windows": ["%USERPROFILE%\\.ssh"],
+        "linux": ["$HOME/.ssh"]
+      },
+      "excludes": ["known_hosts"]
+    }
+  ]
+}

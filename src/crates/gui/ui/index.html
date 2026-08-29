@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>应用备份工具</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>应用备份工具</h1>
+    <div class="actions">
+      <button id="btn-backup-all">全部备份</button>
+      <button id="btn-restore" class="ghost">恢复</button>
+      <button id="btn-settings" class="ghost">设置</button>
+      <button id="btn-exit" class="ghost">退出</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" id="apps-panel">
+      <div class="panel-title">
+        <span>应用列表 <span id="apps-count" class="title-count"></span></span>
+        <span class="mini-actions">
+          <label class="mini"><input type="checkbox" id="select-all" /> 全选</label>
+        </span>
+      </div>
+      <ul id="app-list" class="app-list"></ul>
+      <div class="panel-foot app-toolbar">
+        <button id="btn-add-app" class="ghost small">+ 添加应用</button>
+        <button id="btn-edit-app" class="ghost small" disabled title="请先在列表中选择一个应用">编辑</button>
+        <button id="btn-delete-app" class="ghost small danger" disabled title="请先在列表中选择一个应用">删除</button>
+      </div>
+    </section>
+
+    <section class="panel" id="history-panel">
+      <div class="panel-title">备份历史</div>
+      <ul id="history-list" class="history-list"></ul>
+      <div class="panel-foot" id="history-count"></div>
+    </section>
+
+    <section class="panel" id="log-panel">
+      <div class="panel-title">
+        操作 / 日志
+        <span class="mini-actions">
+          <button id="btn-backup" class="small primary">备份所选</button>
+          <button id="btn-stop" class="small danger" disabled>停止</button>
+        </span>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-row">
+          <span class="progress-label" id="overall-label">总进度</span>
+          <div class="bar"><div class="bar-fill" id="overall-bar"></div></div>
+          <span class="progress-text" id="overall-text">—</span>
+        </div>
+        <div id="app-progress" class="app-progress"></div>
+      </div>
+      <div id="log" class="log"></div>
+    </section>
+  </main>
+
+  <footer id="footer">备份位置: —</footer>
+
+  <!-- 应用编辑抽屉 -->
+  <div id="app-drawer" class="drawer hidden">
+    <div class="drawer-box">
+      <div class="drawer-title">
+        <span id="app-drawer-title">添加应用</span>
+        <button id="app-drawer-close" class="ghost">✕</button>
+      </div>
+      <div class="form">
+        <div id="app-form-error" class="form-error hidden" role="alert"></div>
+        <div class="field">
+          <span class="field-title">名称 *</span>
+          <input id="f-name" type="text" placeholder="例如 VSCode" />
+        </div>
+        <div class="form-row check-row">
+          <label class="check"><input type="checkbox" id="f-enabled" checked /> 启用</label>
+          <label class="check"><input type="checkbox" id="f-compress" checked /> 压缩打包</label>
+        </div>
+
+        <div class="field">
+          <span class="field-title">备份路径（当前平台）</span>
+          <div id="path-list"></div>
+          <button id="add-path" class="ghost small">+ 添加路径</button>
+        </div>
+
+        <div class="field">
+          <span class="field-title">排除规则 (glob)</span>
+          <div id="exclude-list"></div>
+          <button id="add-exclude" class="ghost small">+ 添加排除</button>
+        </div>
+      </div>
+      <div class="drawer-foot">
+        <button id="app-drawer-delete" class="danger hidden">删除</button>
+        <span class="spacer"></span>
+        <button id="app-drawer-cancel" class="ghost">取消</button>
+        <button id="app-drawer-save" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 设置抽屉 -->
+  <div id="settings-drawer" class="drawer hidden">
+    <div class="drawer-box wide">
+      <div class="drawer-title">
+        <span>设置</span>
+        <button id="settings-close" class="ghost">✕</button>
+      </div>
+      <div class="form">
+        <div id="settings-error" class="form-error hidden" role="alert"></div>
+        <div class="field">
+          <span class="field-title">备份位置</span>
+          <div class="path-row">
+            <div class="path-inputs">
+              <input id="s-dest" type="text" placeholder="$HOME/backups 或 %USERPROFILE%\backups" />
+            </div>
+            <button id="s-pick-dest" class="pick-btn">选择</button>
+          </div>
+        </div>
+        <div class="form-row settings-row">
+          <label>备份格式
+            <select id="s-format">
+              <option value="zip">zip</option>
+              <option value="tar.gz">tar.gz</option>
+              <option value="dir">目录复制</option>
+            </select>
+          </label>
+          <label>并行备份数
+            <input id="s-parallel" type="number" min="1" value="2" />
+          </label>
+          <label>保留份数
+            <input id="s-retention" type="number" min="0" value="10" />
+          </label>
+        </div>
+        <div class="field">
+          <span class="field-title">清理时机</span>
+          <select id="s-cleanup">
+            <option value="after_each">每个应用完成后</option>
+            <option value="at_end">全部结束后</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="field-title">全局排除 (glob)</span>
+          <div id="s-exclude-list"></div>
+          <button id="s-add-exclude" class="ghost small">+ 添加排除</button>
+        </div>
+        <div class="field">
+          <span class="field-title">配置文件路径</span>
+          <div class="config-path" id="s-config-path">—</div>
+        </div>
+      </div>
+      <div class="drawer-foot">
+        <button id="s-restore-defaults" class="ghost">恢复默认</button>
+        <button id="s-reload" class="ghost">重新加载</button>
+        <span class="spacer"></span>
+        <button id="s-cancel" class="ghost">取消</button>
+        <button id="s-save" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 恢复向导（占位，完整恢复为 P2） -->
+  <div id="restore-modal" class="modal hidden">
+    <div class="modal-box restore-box">
+      <div class="modal-title">
+        <span>恢复向导</span>
+        <button id="restore-close" class="ghost">✕</button>
+      </div>
+      <div class="restore-body">
+        <div class="steps">
+          <span class="step active">1 选择备份</span>
+          <span class="step">2 预览</span>
+          <span class="step">3 目标与冲突</span>
+          <span class="step">4 确认</span>
+        </div>
+        <div class="notice">完整恢复为 P2 未实现：当前向导仅展示备份历史，后续步骤与执行按钮暂不可用。</div>
+        <ul id="restore-list" class="history-list"></ul>
+      </div>
+      <div class="modal-foot">
+        <button id="restore-next" class="primary" disabled title="P2 未实现">下一步 →</button>
+        <button id="restore-run" class="danger" disabled title="P2 未实现">执行恢复</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
